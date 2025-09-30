@@ -1,13 +1,11 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, validator
+from contextlib import asynccontextmanager
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Literal
 from decimal import Decimal, ROUND_DOWN, getcontext
 from datetime import datetime, timezone
-from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime,
-    Numeric, Text
-)
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Numeric, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 from fastapi.responses import JSONResponse
@@ -17,12 +15,14 @@ getcontext().prec = 28
 
 Base = declarative_base()
 
+
 # --- Database models ---
 class Meter(Base):
     __tablename__ = "meter"
     id = Column(Integer, primary_key=True, autoincrement=True)
     # store current kWh
     current_kwh = Column(Numeric(12, 2), nullable=False)
+
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -33,7 +33,12 @@ class Transaction(Base):
     delta_kwh = Column(Numeric(12, 2), nullable=False)
     rand_amount = Column(Numeric(14, 2), nullable=True)  # R amount for topups
     note = Column(Text, nullable=True)
-    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    timestamp = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
 
 # --- Database setup ---
 DATABASE_URL = "sqlite:///./meter.db"
@@ -41,7 +46,6 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Prepaid Electricity Meter API")
 
 # Ensure there is a meter row (single row app)
 def get_or_create_meter(db):
@@ -53,11 +57,13 @@ def get_or_create_meter(db):
         db.refresh(meter)
     return meter
 
+
 # Helper for quantizing decimals to 2 decimal places
 def quantize_kwh(value) -> Decimal:
     if not isinstance(value, Decimal):
         value = Decimal(value)
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
 
 def quantize_rand(value) -> Decimal:
     if value is None:
@@ -66,44 +72,54 @@ def quantize_rand(value) -> Decimal:
         value = Decimal(value)
     return value.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
+
 # --- Pydantic models ---
 class SetMeterRequest(BaseModel):
-    kwh: Decimal = Field(..., description="Absolute value to set current meter to (kWh)")
+    kwh: Decimal = Field(
+        ..., description="Absolute value to set current meter to (kWh)"
+    )
     note: Optional[str] = None
 
-    @validator("kwh")
+    @field_validator("kwh")
     def two_decimal_places(cls, v):
         try:
             return quantize_kwh(v)
         except Exception:
             raise ValueError("kwh must be a number")
 
+
 class TopUpRequest(BaseModel):
     # Either rand_amount + price_per_kwh OR kwh must be supplied.
-    rand_amount: Optional[Decimal] = Field(None, description="Amount in South African Rands (R)")
-    price_per_kwh: Optional[Decimal] = Field(None, description="Price per kWh in R; required if rand_amount provided")
-    kwh: Optional[Decimal] = Field(None, description="kWh to add directly (if you prefer to top-up by kWh)")
+    rand_amount: Optional[Decimal] = Field(
+        None, description="Amount in South African Rands (R)"
+    )
+    price_per_kwh: Optional[Decimal] = Field(
+        None, description="Price per kWh in R; required if rand_amount provided"
+    )
+    kwh: Optional[Decimal] = Field(
+        None, description="kWh to add directly (if you prefer to top-up by kWh)"
+    )
     note: Optional[str] = None
 
-    @validator("rand_amount", "price_per_kwh", "kwh", pre=True)
+    @field_validator("rand_amount", "price_per_kwh", "kwh", mode="before")
     def accept_strings(cls, v):
         if v is None:
             return None
         return Decimal(str(v))
 
-    @validator("kwh")
+    @field_validator("kwh")
     def quantize_kwh_field(cls, v):
         if v is None:
             return None
         return quantize_kwh(v)
 
-    @validator("rand_amount")
+    @field_validator("rand_amount")
     def quantize_rand_field(cls, v):
         if v is None:
             return None
         return quantize_rand(v)
 
-    @validator("price_per_kwh")
+    @field_validator("price_per_kwh")
     def quantize_price(cls, v):
         if v is None:
             return None
@@ -117,10 +133,13 @@ class TopUpRequest(BaseModel):
             return quantize_kwh(self.kwh)
         if self.rand_amount is not None:
             if not self.price_per_kwh or self.price_per_kwh == Decimal("0"):
-                raise ValueError("price_per_kwh must be provided and non-zero when using rand_amount")
-            delta = (self.rand_amount / self.price_per_kwh)
+                raise ValueError(
+                    "price_per_kwh must be provided and non-zero when using rand_amount"
+                )
+            delta = self.rand_amount / self.price_per_kwh
             return quantize_kwh(delta)
         raise ValueError("Either kwh or rand_amount (+ price_per_kwh) must be provided")
+
 
 class TransactionOut(BaseModel):
     id: int
@@ -133,17 +152,26 @@ class TransactionOut(BaseModel):
     timestamp: datetime
 
     class Config:
-        orm_mode = True
+        from_attributes = True
+
 
 # --- API endpoints ---
 
-@app.on_event("startup")
-def startup_event():
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- startup ---
     db = SessionLocal()
     try:
-        get_or_create_meter(db)
+        get_or_create_meter(db)  # make sure meter row exists
     finally:
         db.close()
+
+    yield  # <- app runs between startup and shutdown
+
+    # --- shutdown (if needed) ---
+    # e.g. clean up resources, close connections
+app = FastAPI(title="Prepaid Electricity Meter API", lifespan=lifespan)
 
 @app.get("/meter", response_model=dict)
 def get_meter():
@@ -154,6 +182,7 @@ def get_meter():
         return {"current_kwh": quantize_kwh(meter.current_kwh)}
     finally:
         db.close()
+
 
 @app.post("/meter/set", response_model=TransactionOut)
 def set_meter(payload: SetMeterRequest):
@@ -176,7 +205,7 @@ def set_meter(payload: SetMeterRequest):
             delta_kwh=delta,
             rand_amount=None,
             note=payload.note,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
         )
         db.add(tx)
         db.commit()
@@ -187,6 +216,7 @@ def set_meter(payload: SetMeterRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
 
 @app.post("/meter/topup", response_model=TransactionOut)
 def topup_meter(payload: TopUpRequest):
@@ -204,7 +234,11 @@ def topup_meter(payload: TopUpRequest):
         meter = get_or_create_meter(db)
         prev = quantize_kwh(meter.current_kwh)
         new_kwh = quantize_kwh(prev + delta_kwh)
-        rand_amt = quantize_rand(payload.rand_amount) if payload.rand_amount is not None else None
+        rand_amt = (
+            quantize_rand(payload.rand_amount)
+            if payload.rand_amount is not None
+            else None
+        )
 
         meter.current_kwh = new_kwh
         tx = Transaction(
@@ -214,7 +248,7 @@ def topup_meter(payload: TopUpRequest):
             delta_kwh=delta_kwh,
             rand_amount=rand_amt,
             note=payload.note,
-            timestamp=datetime.now(timezone.utc)
+            timestamp=datetime.now(timezone.utc),
         )
         db.add(tx)
         db.commit()
@@ -228,22 +262,30 @@ def topup_meter(payload: TopUpRequest):
     finally:
         db.close()
 
+
 @app.get("/transactions", response_model=List[TransactionOut])
 def list_transactions(limit: int = Query(200, ge=1, le=5000), offset: int = 0):
     """Return transactions (most recent first)"""
     db = SessionLocal()
     try:
-        q = db.query(Transaction).order_by(Transaction.timestamp.desc()).offset(offset).limit(limit).all()
+        q = (
+            db.query(Transaction)
+            .order_by(Transaction.timestamp.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
         return q
     finally:
         db.close()
+
 
 # Timeseries aggregation suitable for visualization
 @app.get("/timeseries")
 def timeseries(
     from_ts: Optional[datetime] = Query(None, description="ISO datetime, inclusive"),
     to_ts: Optional[datetime] = Query(None, description="ISO datetime, inclusive"),
-    granularity: Literal["hourly", "daily"] = "daily"
+    granularity: Literal["hourly", "daily"] = "daily",
 ):
     """
     Returns aggregated timeseries of meter values over time.
@@ -264,6 +306,7 @@ def timeseries(
 
         # bucket by period
         buckets = {}
+
         def bucket_key(ts: datetime):
             ts = ts.astimezone(timezone.utc)
             if granularity == "hourly":
@@ -280,21 +323,26 @@ def timeseries(
             # we want the last known kwh in the period -> since rows are asc, just overwrite
             entry["kwh"] = quantize_kwh(r.new_kwh)
             if r.rand_amount is not None:
-                entry["rand_spent"] = quantize_rand(entry["rand_spent"] + quantize_rand(r.rand_amount))
+                entry["rand_spent"] = quantize_rand(
+                    entry["rand_spent"] + quantize_rand(r.rand_amount)
+                )
 
         # convert to sorted list
         out = []
         for k in sorted(buckets.keys()):
             entry = buckets[k]
-            out.append({
-                "period_start": entry["period_start"].isoformat(),
-                "kwh": entry["kwh"],
-                "rand_spent": entry["rand_spent"]
-            })
+            out.append(
+                {
+                    "period_start": entry["period_start"].isoformat(),
+                    "kwh": entry["kwh"],
+                    "rand_spent": entry["rand_spent"],
+                }
+            )
 
         return {"granularity": granularity, "series": out}
     finally:
         db.close()
+
 
 @app.get("/summary")
 def summary():
@@ -305,24 +353,36 @@ def summary():
     try:
         meter = get_or_create_meter(db)
         total_topups = db.query(Transaction).filter(Transaction.type == "topup").all()
-        total_r = sum([t.rand_amount or Decimal("0.00") for t in total_topups], Decimal("0.00"))
+        total_r = sum(
+            [t.rand_amount or Decimal("0.00") for t in total_topups], Decimal("0.00")
+        )
         total_kwh_added = sum([t.delta_kwh for t in total_topups], Decimal("0.00"))
         total_tx = db.query(Transaction).count()
         return {
             "current_kwh": quantize_kwh(meter.current_kwh),
             "total_topups_rand": quantize_rand(total_r),
             "total_topups_kwh": quantize_kwh(total_kwh_added),
-            "total_transactions": total_tx
+            "total_transactions": total_tx,
         }
     finally:
         db.close()
+
 
 # Simple health
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
+
 # Generic exception handler for Decimal -> JSON conversions
 @app.exception_handler(HTTPException)
 def http_exception_handler(request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc.detail)})
+    return JSONResponse(
+        status_code=exc.status_code, content={"detail": str(exc.detail)}
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="127.0.0.1", port=3001, reload=True)
+    
